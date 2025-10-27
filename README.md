@@ -50,7 +50,7 @@ All beacon-chain inflows for your validator or wallet are written to a single ta
 3. Open Extensions → Apps Script.
 
 ### Add the script and configure
-1. In Apps Script, paste the project code.
+1. In Apps Script, paste the project code (GetRewards).
 2. At the top of the script, set these constants:
 
 ```javascript
