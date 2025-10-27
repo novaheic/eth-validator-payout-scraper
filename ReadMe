@@ -1,0 +1,100 @@
+# Ethereum Validator Rewards Tracker
+
+**Automated tracking of Ethereum validator rewards with historical price data for tax and accounting purposes.**
+
+This Google Apps Script automatically fetches all your validator payouts (beacon chain withdrawals and block production rewards) from Etherscan and matches each transaction with accurate historical ETH prices from Kraken. Perfect for tax reporting, accounting, and tracking your staking income in your preferred fiat currency.
+
+---
+
+## Beacon Chain Inflows → Google Sheets (Apps Script)
+
+This script pulls all beacon-chain inflows for your validator/wallet into a single sheet with four columns: Time/Date, Amount (ETH), Type, and ETH Price. It combines:
+- **Withdrawals**: Consensus layer withdrawals paid to your withdrawal address (via Etherscan v2)
+- **Block rewards**: Execution layer payouts when you propose a block (via Etherscan mined-blocks + block reward)
+- **Historical prices**: Matched ETH prices in your chosen currency at the time of each transaction (via Kraken)
+
+### Requirements
+- A Google Sheet you control
+- An Etherscan API key (free is fine)
+  - Create one in Etherscan → Profile → API Keys (or see the Etherscan docs)
+- Your Ethereum addresses:
+  - Withdrawal address (where beacon-chain withdrawals land)
+  - Fee recipient (coinbase) address used by your validator for EL payouts
+    - Often the same as the withdrawal address, but not always
+- Your validator index(es) (optional; not required for the current script)
+
+### Set up the Google Sheet
+1) Create a new Google Sheet (or use an existing one)
+2) Add a sheet named exactly: BeaconChainInflows
+3) Open Extensions → Apps Script
+
+### Add the script
+1) In Apps Script, paste the code file contents you were given for this project
+2) At the top of the script, set the configuration constants:
+
+```javascript
+// Required
+const SHEET_NAME = 'BeaconChainInflows';
+const WALLET_ADDRESS = '0x...'; // your withdrawal (execution) address
+const FEE_RECIPIENT_ADDRESS = '0x...'; // your fee recipient (coinbase) address
+const ETHERSCAN_API_KEY = 'YOUR_ETHERSCAN_API_KEY';
+
+// Pricing config (optional - defaults to EUR)
+const PRICE_CURRENCY = 'eur'; // Examples: 'eur', 'usd', 'gbp', 'jpy', 'cad', 'aud', 'chf'
+```
+
+Notes:
+- If you’re unsure whether the fee recipient equals the withdrawal address, check your validator client config or block explorer for proposed blocks; use that address for FEE_RECIPIENT_ADDRESS.
+- The script writes to the `BeaconChainInflows` sheet and sorts entries by timestamp ascending.
+
+### Price source (Kraken API)
+Prices in column D are fetched from **Kraken's public OHLC API** (no key required):
+- Free, reliable, no rate limits
+- Works perfectly with Google Apps Script (no Cloudflare blocking)
+- Direct support for ETH/EUR, ETH/USD, ETH/GBP, ETH/JPY, ETH/CAD, ETH/AUD, ETH/CHF
+- Other currencies use ETH/USD + real-time FX conversion
+
+**Adaptive time intervals for historical data:**
+The script automatically selects the best interval based on how far back your data goes:
+- **0-30 days**: Hourly candles (best precision for recent data)
+- **30 days - 2 years**: Daily candles (good balance)
+- **2+ years**: Weekly candles (covers up to ~14 years of history)
+
+This ensures accurate prices across your entire transaction history, whether it's from yesterday or from several years ago. Prices are automatically matched to the nearest timestamp for each event.
+
+### Run it
+1) In Apps Script, click the function selector and choose `BeaconChainInflows_refresh`
+2) Click Run and authorize the script when prompted
+3) Return to the Sheet; you should see rows with:
+   - Time/Date
+   - Amount (ETH)
+   - Type = "Withdrawal" or "Block produced"
+
+A custom menu “Beacon Chain” → “Refresh inflows” is also added for quick manual refreshes.
+
+### Optional: schedule auto-refresh
+1) In Apps Script, click Triggers (clock icon)
+2) Add Trigger → choose function `BeaconChainInflows_refresh`
+3) Event source: Time-driven → select your frequency (e.g., Hour timer)
+
+### Troubleshooting
+- Empty sheet?
+  - Ensure `ETHERSCAN_API_KEY` is set and valid
+  - Double-check `WALLET_ADDRESS` (withdrawals) and `FEE_RECIPIENT_ADDRESS` (block payouts)
+  - Open View → Logs to see endpoint results and any errors
+- See “You are using a deprecated V1 endpoint”?
+  - You are already on Etherscan v2 in this script; verify your API key and network (mainnet)
+- No block-produced entries but there should be some?
+  - Your fee recipient may differ from your withdrawal address; set `FEE_RECIPIENT_ADDRESS` accordingly
+  - If you’ve proposed many blocks, increase pagination in `listMinedBlocks` (offset) or loop pages
+- Rate limits
+  - Free Etherscan keys are limited; the script staggers requests but very large histories may require multiple runs
+
+### What gets recorded
+- Withdrawals: consensus-layer withdrawals credited to `WALLET_ADDRESS` (amounts parsed from Gwei → ETH)
+- Block produced: execution-layer block reward (including tips) paid to `FEE_RECIPIENT_ADDRESS` for each proposed block (Wei → ETH)
+- ETH Price (PRICE_CURRENCY): historical price from Kraken (hourly/daily/weekly depending on age) matched to the nearest timestamp of each event
+
+That’s it! After configuring the constants and running once, you’ll have a unified ledger of inflows on a single tab.
+
+

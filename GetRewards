@@ -1,0 +1,379 @@
+/**************** CONFIG ****************/
+const SHEET_NAME = 'BeaconChainInflows';
+const WALLET_ADDRESS = 'YOUR_WALLET_ADDRESS'; // withdrawal address (for withdrawals)
+const FEE_RECIPIENT_ADDRESS = 'YOUR_FEE_RECIPIENT_ADDRESS'; // set to your fee recipient (coinbase) address
+const ETHERSCAN_API_KEY = 'YOUR_ETHERSCAN_API_KEY';
+/****************************************/
+// Pricing config
+// Default fiat currency for column D. Examples: 'eur', 'usd', 'gbp', 'jpy', 'cad', 'aud', 'chf'
+// Supported currencies: any currency with a direct Kraken ETH pair, or USD + FX conversion for others
+const PRICE_CURRENCY = 'eur';
+/****************************************/
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Beacon Chain')
+    .addItem('Refresh inflows', 'BeaconChainInflows_refresh')
+    .addToUi();
+}
+
+function BeaconChainInflows_refresh() {
+  const sheet = getOrCreateSheet(SHEET_NAME);
+  sheet.clearContents();
+  const currency = String(PRICE_CURRENCY || 'eur').toLowerCase();
+  sheet.getRange(1, 1, 1, 4).setValues([[
+    'Time/Date',
+    'Amount (ETH)',
+    'Type',
+    `ETH Price (${currency.toUpperCase()})`
+  ]]);
+
+  // Withdrawals (Etherscan v2 - already working for you)
+  const withdrawals = fetchWithdrawalsFromEtherscanV2(WALLET_ADDRESS, ETHERSCAN_API_KEY);
+  Logger.log(`Withdrawals: ${withdrawals.length}`);
+
+  // Block-produced direct payouts (execution layer) via Etherscan
+  const directPayouts = fetchBlockProposerRewardsFromEtherscan(FEE_RECIPIENT_ADDRESS, ETHERSCAN_API_KEY);
+  Logger.log(`Block-produced payouts: ${directPayouts.length}`);
+
+  const all = withdrawals.concat(directPayouts).sort((a, b) => a.timestamp - b.timestamp);
+  if (all.length === 0) {
+    Logger.log('No data found.');
+    return;
+  }
+
+  // Fetch historical ETH prices in target currency from Kraken
+  const timestamps = all.map(e => e.timestamp);
+  const priceSeries = fetchEthPriceSeries(timestamps[0], timestamps[timestamps.length - 1], currency);
+  Logger.log(`Price series points: ${priceSeries.length}`);
+  
+  const fiatPrices = mapNearestFiatPrices(timestamps, priceSeries);
+  const numPrices = fiatPrices.filter(v => typeof v === 'number' && !isNaN(v)).length;
+  Logger.log(`Mapped prices filled: ${numPrices}/${fiatPrices.length}`);
+
+  const rows = all.map((e, i) => [new Date(e.timestamp * 1000), e.amountEth, e.type, fiatPrices[i]]);
+  sheet.getRange(2, 1, rows.length, 4).setValues(rows);
+  sheet.getRange(2, 1, rows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  sheet.getRange(2, 2, rows.length, 1).setNumberFormat('0.000000000');
+  sheet.getRange(2, 4, rows.length, 1).setNumberFormat(currencyFormatFor(PRICE_CURRENCY));
+}
+
+/************** Etherscan: Withdrawals (v2) **************/
+function fetchWithdrawalsFromEtherscanV2(address, apiKey) {
+  const url = `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txsBeaconWithdrawal&address=${address}&page=1&offset=10000&sort=asc&apikey=${encodeURIComponent(apiKey)}`;
+  const { statusCode, json } = fetchRaw(url);
+  Logger.log(`Etherscan withdrawals HTTP ${statusCode}`);
+  if (statusCode !== 200 || !json || !Array.isArray(json.result)) return [];
+
+  return json.result.map(it => {
+    const ts = Number(it.timestamp || it.timeStamp);
+    const amountGwei = Number(it.amount || 0);
+    if (!ts || !amountGwei) return null;
+    return { timestamp: ts, amountEth: amountGwei / 1e9, type: 'Withdrawal' };
+  }).filter(Boolean);
+}
+
+/************** Etherscan: Block proposer rewards **************/
+function fetchBlockProposerRewardsFromEtherscan(address, apiKey) {
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    Logger.log('Invalid FEE_RECIPIENT_ADDRESS.');
+    return [];
+  }
+
+  // 1) List blocks proposed (aka “mined”) by this fee recipient
+  const blocks = listMinedBlocks(address, apiKey); // [{blockNumber, timeStamp}]
+  Logger.log(`Blocks listed: ${blocks.length}`);
+  if (!blocks.length) return [];
+
+  // 2) For each block, fetch reward
+  const out = [];
+  for (const b of blocks) {
+    const rewardWei = fetchBlockRewardWei(b.blockNumber, apiKey);
+    if (rewardWei === null) continue;
+    out.push({
+      timestamp: Number(b.timeStamp || b.timestamp),
+      amountEth: Number(rewardWei) / 1e18,
+      type: 'Block produced'
+    });
+    Utilities.sleep(125); // be gentle on rate limits
+  }
+  return out;
+}
+
+function listMinedBlocks(address, apiKey) {
+  // Try v2 then v1
+  const candidates = [
+    `https://api.etherscan.io/v2/api?chainid=1&module=account&action=getminedblocks&address=${address}&blocktype=blocks&page=1&offset=200&apikey=${encodeURIComponent(apiKey)}`,
+    `https://api.etherscan.io/api?module=account&action=getminedblocks&address=${address}&blocktype=blocks&page=1&offset=200&apikey=${encodeURIComponent(apiKey)}`
+  ];
+  for (const url of candidates) {
+    const { statusCode, json } = fetchRaw(url);
+    Logger.log(`getminedblocks HTTP ${statusCode} ${url}`);
+    if (statusCode !== 200 || !json) continue;
+
+    // v1 shape: { status:'1', result:[{blockNumber, timeStamp}] }
+    if (json.status === '1' && Array.isArray(json.result)) {
+      return json.result.map(x => ({ blockNumber: String(x.blockNumber), timeStamp: Number(x.timeStamp) }));
+    }
+    // v2 shape possibilities: { status:'OK', data:[...] } or { result:{records:[...]} }
+    if (Array.isArray(json.data)) {
+      return json.data.map(x => ({ blockNumber: String(x.blockNumber || x.block_no), timeStamp: Number(x.timestamp || x.timeStamp) })).filter(x => x.blockNumber && x.timeStamp);
+    }
+    if (json.result && Array.isArray(json.result.records)) {
+      return json.result.records.map(x => ({ blockNumber: String(x.blockNumber || x.block_no), timeStamp: Number(x.timestamp || x.timeStamp) })).filter(x => x.blockNumber && x.timeStamp);
+    }
+  }
+  return [];
+}
+
+function fetchBlockRewardWei(blockNumber, apiKey) {
+  const candidates = [
+    `https://api.etherscan.io/api?module=block&action=getblockreward&blockno=${blockNumber}&apikey=${encodeURIComponent(apiKey)}`,
+    `https://api.etherscan.io/v2/api?chainid=1&module=block&action=getblockreward&blockno=${blockNumber}&apikey=${encodeURIComponent(apiKey)}`
+  ];
+  for (const url of candidates) {
+    const { statusCode, json } = fetchRaw(url);
+    Logger.log(`getblockreward HTTP ${statusCode} for #${blockNumber}`);
+    if (statusCode !== 200 || !json) continue;
+
+    // v1 shape: { status:'1', result:{ blockReward:'...' } }
+    if (json.status === '1' && json.result && json.result.blockReward !== undefined) {
+      return Number(json.result.blockReward);
+    }
+    // v2 shape variants
+    if (json.result && json.result.blockReward !== undefined) {
+      return Number(json.result.blockReward);
+    }
+    if (json.data && json.data.blockReward !== undefined) {
+      return Number(json.data.blockReward);
+    }
+  }
+  return null;
+}
+
+/**************** Helpers ****************/
+function fetchRaw(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, headers: { 'Accept': 'application/json' } });
+    const code = res.getResponseCode();
+    let json = null;
+    const text = res.getContentText();
+    try { json = JSON.parse(text); } catch (_) {}
+    return { statusCode: code, json };
+  } catch (e) {
+    Logger.log(`Fetch error: ${e}`);
+    return { statusCode: 0, json: null };
+  }
+}
+
+function getOrCreateSheet(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  return sheet;
+}
+
+function mapNearestFiatPrices(timestampsSecAsc, priceSeries) {
+  const result = new Array(timestampsSecAsc.length).fill('');
+  if (!priceSeries.length) return result;
+  let j = 0;
+  for (let i = 0; i < timestampsSecAsc.length; i++) {
+    const tsMs = timestampsSecAsc[i] * 1000;
+    while (j + 1 < priceSeries.length && priceSeries[j + 1][0] <= tsMs) j++;
+    let bestIdx = j;
+    if (j + 1 < priceSeries.length) {
+      const d0 = Math.abs(priceSeries[j][0] - tsMs);
+      const d1 = Math.abs(priceSeries[j + 1][0] - tsMs);
+      if (d1 < d0) bestIdx = j + 1;
+    }
+    result[i] = Number(priceSeries[bestIdx][1]);
+  }
+  return result;
+}
+
+function currencyFormatFor(code) {
+  const c = String(code || '').toLowerCase();
+  if (c === 'usd') return '$#,##0.00';
+  if (c === 'eur') return '€#,##0.00';
+  if (c === 'gbp') return '£#,##0.00';
+  if (c === 'jpy') return '¥#,##0';
+  return '#,##0.00';
+}
+
+// ---------- Kraken Price Fetching ----------
+// Kraken public API: reliable, no auth required, works with Google Apps Script
+// OHLC endpoint provides hourly/daily/weekly candles going back 5+ years
+function fetchEthPriceSeries(fromTsSec, toTsSec, currency) {
+  const cur = String(currency || 'eur').toLowerCase();
+  
+  // Map currency to Kraken pair
+  const pairMap = {
+    'eur': 'ETHEUR',
+    'usd': 'ETHUSD', 
+    'gbp': 'ETHGBP',
+    'jpy': 'ETHJPY',
+    'cad': 'ETHCAD',
+    'aud': 'ETHAUD',
+    'chf': 'ETHCHF'
+  };
+  
+  const pair = pairMap[cur];
+  if (!pair) {
+    Logger.log(`Currency ${cur.toUpperCase()} not directly supported by Kraken. Using USD with FX conversion.`);
+    return fetchEthUsdWithFxConversion(fromTsSec, toTsSec, cur);
+  }
+  
+  return fetchKrakenOHLC(pair, fromTsSec, toTsSec);
+}
+
+function fetchKrakenOHLC(pair, fromTsSec, toTsSec) {
+  try {
+    const fromSec = Number(fromTsSec);
+    const toSec = Number(toTsSec);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const daysAgo = (nowSec - fromSec) / 86400;
+    
+    // Choose interval based on how far back we need to go
+    // Kraken returns max 720 candles per request:
+    // - Hourly (60 min): 720 hours = 30 days
+    // - Daily (1440 min): 720 days = ~2 years  
+    // - Weekly (10080 min): 720 weeks = ~14 years
+    let intervalMinutes, intervalName;
+    if (daysAgo <= 30) {
+      intervalMinutes = 60;    // Hourly
+      intervalName = 'hourly';
+    } else if (daysAgo <= 700) {
+      intervalMinutes = 1440;  // Daily
+      intervalName = 'daily';
+    } else {
+      intervalMinutes = 10080; // Weekly
+      intervalName = 'weekly';
+    }
+    const intervalSec = intervalMinutes * 60;
+    
+    // Fetch all available data by paging backwards
+    const allPrices = [];
+    let currentEnd = toSec;
+    const targetStart = fromSec;
+    
+    let batchCount = 0;
+    const maxBatches = 20; // Safety limit
+    
+    while (currentEnd > targetStart && batchCount < maxBatches) {
+      batchCount++;
+      
+      // Calculate batch start (up to 720 candles back)
+      const batchStart = Math.max(targetStart, currentEnd - (720 * intervalSec));
+      
+      const url = `https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${intervalMinutes}&since=${batchStart}`;
+      
+      const res = UrlFetchApp.fetch(url, { 
+        muteHttpExceptions: true,
+        headers: { 'Accept': 'application/json' }
+      });
+      
+      if (res.getResponseCode() !== 200) {
+        Logger.log(`Kraken HTTP ${res.getResponseCode()}`);
+        break;
+      }
+      
+      const json = JSON.parse(res.getContentText());
+      
+      if (json.error && json.error.length > 0) {
+        Logger.log(`Kraken API error: ${json.error.join(', ')}`);
+        break;
+      }
+      
+      if (!json.result) break;
+      
+      const pairKey = Object.keys(json.result).find(k => k !== 'last');
+      if (!pairKey) break;
+      
+      const candles = json.result[pairKey];
+      if (!Array.isArray(candles) || candles.length === 0) break;
+      
+      // Extract prices from candles
+      let oldestTs = currentEnd;
+      for (const candle of candles) {
+        const ts = Number(candle[0]);
+        const close = Number(candle[4]);
+        
+        if (ts >= targetStart && ts <= toSec) {
+          if (Number.isFinite(ts) && Number.isFinite(close)) {
+            allPrices.push([ts * 1000, close]); // Convert to ms
+          }
+        }
+        
+        if (ts < oldestTs) oldestTs = ts;
+      }
+      
+      // Check if we need to go further back
+      if (oldestTs > targetStart && candles.length === 720) {
+        currentEnd = oldestTs - intervalSec;
+        Utilities.sleep(500); // Rate limit
+      } else {
+        break; // Reached the start or end of available data
+      }
+    }
+    
+    if (allPrices.length === 0) {
+      Logger.log('Kraken: no price data returned');
+      return [];
+    }
+    
+    allPrices.sort((a, b) => a[0] - b[0]);
+    return allPrices;
+    
+  } catch (e) {
+    Logger.log(`Kraken error: ${e}`);
+    return [];
+  }
+}
+
+function fetchEthUsdWithFxConversion(fromTsSec, toTsSec, targetCurrency) {
+  // Fetch ETH/USD from Kraken
+  const usdPrices = fetchKrakenOHLC('ETHUSD', fromTsSec, toTsSec);
+  if (usdPrices.length === 0) return [];
+  
+  // Get FX rate
+  const fxRate = fetchCurrentFxRate('usd', targetCurrency);
+  if (!fxRate) {
+    Logger.log(`Could not get FX rate USD -> ${targetCurrency.toUpperCase()}`);
+    return [];
+  }
+  
+  return usdPrices.map(([ts, price]) => [ts, price * fxRate]);
+}
+
+// Get current FX rate for currency conversion
+function fetchCurrentFxRate(fromCurrency, toCurrency) {
+  try {
+    const from = String(fromCurrency).toUpperCase();
+    const to = String(toCurrency).toUpperCase();
+    
+    if (from === to) return 1.0;
+    
+    const url = `https://api.exchangerate-api.com/v4/latest/${from}`;
+    const res = UrlFetchApp.fetch(url, { 
+      muteHttpExceptions: true,
+      headers: { 'Accept': 'application/json' }
+    });
+    
+    if (res.getResponseCode() !== 200) {
+      Logger.log(`FX API HTTP ${res.getResponseCode()}`);
+      return null;
+    }
+    
+    const json = JSON.parse(res.getContentText());
+    const rate = json.rates?.[to];
+    
+    if (typeof rate === 'number' && rate > 0) {
+      return rate;
+    }
+    
+    return null;
+  } catch (e) {
+    Logger.log(`FX rate error: ${e}`);
+    return null;
+  }
+}
