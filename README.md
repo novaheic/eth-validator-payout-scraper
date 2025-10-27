@@ -5,27 +5,14 @@
   
 </p>
 
-Automated tracking of Ethereum validator rewards with historical price data for tax and accounting.
+Automated tracking of Ethereum validator rewards with historical price data for tax and accounting using google sheets.
 
 This Google Apps Script fetches your validator inflows (beacon-chain withdrawals and execution-layer block rewards) via Etherscan and matches each event with accurate historical ETH prices from Kraken, writing everything into Google Sheets in your preferred fiat currency.
 
 ---
 
-## Table of contents
-- [Overview](#overview)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Setup](#setup)
-  - [Create your Sheet](#create-your-sheet)
-  - [Add the script and configure](#add-the-script-and-configure)
-- [Price source (Kraken)](#price-source-kraken)
-- [Run it](#run-it)
-- [Optional: schedule auto-refresh](#optional-schedule-auto-refresh)
-- [Troubleshooting](#troubleshooting)
-- [What gets recorded](#what-gets-recorded)
-
 ## Overview
-All beacon-chain inflows for your validator or wallet are written to a single tab with four columns: Time/Date, Amount (ETH), Type, and ETH Price. The sheet is sorted by timestamp ascending.
+All beacon-chain inflows for your validator or wallet are written to a single google sheets tab with four columns: Time/Date, Amount (ETH), Type, and ETH Price. The sheet is sorted by timestamp ascending.
 
 ## Features
 - Withdrawals (consensus layer) via Etherscan v2
